@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Generated, not source: the self-test model of tools/gguf_writer.py
+bench/tiny-*.gguf
+*.log
+build*/*
+!build-rel/
+build-rel/*
+!build-rel/strata.exe
+!build-rel/libblosc2.dll
+!build-rel/BUILD.json
+pack/
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Intel VTune: result folders (r000hs/, r001gpuh/ ...) and their .vtune files
+r[0-9][0-9][0-9]*/
+*.vtune
+
+# created by setup.py on the user's machine
+/.venv
+/third_party/main/llama.cpp
+/models/
+/packs/
+/mtp/
+/run-*.sh
+/xestrata-*.json
+/strata-xe-iq3_s.json
+/xe_serve_engine.log
+/xestrata-*.log
+
+# setup.py outputs (engine, downloads)
+/engine/
+*.done
+/third_party/main/*.zip
+/third_party/main/_unpack/
+
+# lint tools that are not in the distribution's packages (see AGENTS.md, Lints)
+/.lint
+# developer tools built from source (docs/DEVTOOLS.md)
+/.tools
+.mypy_cache/
+.ruff_cache/
+# tools/strata_mcp.py: the processes it started and their logs
+/.strata-mcp/
+# IDEs
+.vscode/
+.idea/
+.cursor/
+
+/.ccache/
+# notes about this machine for coding agents (AGENTS.md)
+/LOCAL.md
+data/conv-sessions/ 
+data/expert-profile-learned.bin 

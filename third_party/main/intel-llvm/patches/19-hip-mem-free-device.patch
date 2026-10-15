@@ -1,0 +1,33 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-mem-free-device: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The HIP adapter answered a device's free memory (UR_DEVICE_INFO_GLOBAL_MEM_FREE, SYCL's
+ext_intel_free_memory) with hipMemGetInfo without making that device current, so every AMD GPU reported
+the free memory of the thread's current one.  With two AMD GPUs in a layer split, the second stage saw the
+first one's free memory, nearly all of it held by the first stage's expert cache, found no room for its
+own cache and the engine stopped.  Fixed, the device is made current first, as the adapter's other calls
+do (the CUDA adapter's urDeviceGetInfo sets its context for every query).
+---
+diff --git a/unified-runtime/source/adapters/hip/device.cpp b/unified-runtime/source/adapters/hip/device.cpp
+--- a/unified-runtime/source/adapters/hip/device.cpp
++++ b/unified-runtime/source/adapters/hip/device.cpp
+@@ -6,6 +6,7 @@
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ // Modified 2026 by MistVVK and the XeStrata contributors: a bundle for another architecture is not selected (hip-bundle-arch)
++// Modified 2026 by MistVVK and the XeStrata contributors: the free memory is the queried device's (hip-mem-free-device)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -680,6 +681,8 @@
+ 
+     size_t FreeMemory = 0;
+     size_t TotalMemory = 0;
++    // hipMemGetInfo answers for the thread's current device, not hDevice
++    ScopedDevice Active(hDevice);
+     UR_CHECK_ERROR(hipMemGetInfo(&FreeMemory, &TotalMemory));
+     return ReturnValue(FreeMemory);
+   }

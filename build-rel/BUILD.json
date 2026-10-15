@@ -1,0 +1,9 @@
+{
+  "name": "XeStrata",
+  "version": "xe0.1.43.1",
+  "backend": "xe",
+  "upstream": {"name": "Strata", "version": "0.1.43", "commit": "7695859"},
+  "compiler": {"id": "IntelLLVM", "version": "2026.1.1"},
+  "device_code": "SPIR-V JIT",
+  "scope": "device, host memory, transfers, elementwise parity; no inference executable"
+}

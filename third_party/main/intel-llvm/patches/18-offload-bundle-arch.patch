@@ -1,0 +1,49 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+offload-bundle-arch: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+A program built for several NVIDIA or AMD architectures got another architecture's device code under each
+one's name.  SYCL's bundle IDs carry the GPU without an environment field before it
+(sycl-amdgcn-amd-amdhsa-gfx1030), and clang-offload-bundler read it as the triple's environment: the target ID
+was empty, every architecture of a triple matched every other, and unbundling an object or an archive gave
+each architecture's link the first unclaimed entry of the triple in hash order.  The packages' engine had
+gfx1200's code under gfx1030, gfx1030's under gfx1101 and gfx1100's under gfx1201, which an RX 9070 XT
+refused as an illegal instruction.  Fixed, a fifth component that names a GPU is the target ID.
+---
+diff --git a/clang/lib/Driver/OffloadBundler.cpp b/clang/lib/Driver/OffloadBundler.cpp
+--- a/clang/lib/Driver/OffloadBundler.cpp
++++ b/clang/lib/Driver/OffloadBundler.cpp
+@@ -3,6 +3,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: a SYCL bundle ID's GPU is its target ID (offload-bundle-arch)
+ //
+ //===----------------------------------------------------------------------===//
+ ///
+@@ -133,6 +134,23 @@
+   assert((Components.size() == 5 || Components.size() == 6) &&
+          "malformed target string");
+ 
++  // SYCL's bundle IDs have no environment field before the GPU
++  // (sycl-amdgcn-amd-amdhsa-gfx1030, sycl-nvptx64-nvidia-cuda-sm_75).  Read as
++  // the environment, the GPU left the target ID empty, every architecture of a
++  // triple matched every other, and unbundling gave each one's link another
++  // architecture's device code.
++  if (Components.size() == 5 &&
++      clang::StringToOffloadArch(Components.back().split(':').first) !=
++          clang::OffloadArch::UNKNOWN) {
++    this->OffloadKind = Components.front();
++    this->TargetID = Components.back();
++    ArrayRef<StringRef> TripleSlice{&Components[1], /*length=*/3};
++    llvm::Triple T = llvm::Triple(llvm::join(TripleSlice, "-"));
++    this->Triple = llvm::Triple(T.getArchName(), T.getVendorName(),
++                                T.getOSName(), T.getEnvironmentName());
++    return;
++  }
++
+   StringRef TargetIdWithFeature =
+       Components.size() == 6 ? Components.back() : "";
+   StringRef TargetId = TargetIdWithFeature.split(':').first;

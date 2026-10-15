@@ -1,0 +1,112 @@
+XeStrata
+Copyright (C) 2026 MistVVK and the XeStrata contributors
+
+XeStrata is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public
+License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+XeStrata is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+details.
+
+The GNU Lesser General Public License is in COPYING.LESSER; it supplements the GNU General Public License, which is in
+COPYING.
+
+Additional permission under GNU GPL version 3 section 7
+
+If you modify XeStrata, or any covered work, by linking or combining it with a math or compute library that the maker of
+a GPU or CPU publishes for its processors, or with the runtime libraries such a library or its compiler needs (for
+example Intel oneMKL and the runtime libraries of Intel's oneAPI compilers, NVIDIA cuBLAS and the CUDA runtime and
+driver), or with a modified version of such a library, containing parts covered by the terms of that library's license,
+the licensors of XeStrata grant you additional permission to convey the resulting work.
+
+Copyright notices
+=================
+
+Every copyright holder whose work is in this repository, its license and where the license text is:
+
+- Copyright (C) 2026 MistVVK and the XeStrata contributors
+  LGPL-3.0-or-later - XeStrata - COPYING.LESSER, COPYING
+- Copyright (c) 2026 Niko1221 and the Strata contributors
+  MIT - Strata, which XeStrata is a port of; its code is part of XeStrata under the LGPL - text below
+- Copyright (c) 2023-2026 The ggml authors
+  MIT - third_party/main/ggml/ggml-common.h (an unmodified copy, kept under MIT), and the code in src/ transcribed
+  from ggml / llama.cpp (each such file says so in its header; part of XeStrata under the LGPL) - text below and in
+  third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
+  with its own LICENSE
+- Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
+  SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
+- Copyright Codeplay Software Limited; changes Copyright 2026 MistVVK and the XeStrata contributors
+  Apache-2.0 - XeStrata's changes to oneMath (https://github.com/uxlfoundation/oneMath), in XeStrata's fork
+  (https://github.com/MistVVK/oneMath, branch xestrata), whose tag CMakeLists.txt fetches for the dense matrix products. oneMath
+  itself is not in this repository - third_party/main/oneMath/LICENSE, LICENSES/Apache-2.0.txt
+- Copyright the LLVM project contributors; changes Copyright 2026 MistVVK and the XeStrata contributors
+  Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), in
+  third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
+  itself is not in this repository - third_party/main/intel-llvm/LICENSE.TXT, LICENSES/Apache-2.0.txt,
+  LICENSES/LLVM-exception.txt
+- Copyright (c) 2026 Qwen
+  Qwen Community License 1.0 - third_party/nonfree/: material made from or copied from the Qwen3.8-Flash-Next model.
+  Not free software and not covered by the LGPL; XeStrata builds and runs without it - third_party/nonfree/*/LICENSE
+- Copyright (c) 2009-2018 Francesc Alted; Copyright (c) 2019-present Blosc Development Team
+  BSD 3-Clause - c-blosc2 (https://github.com/Blosc/c-blosc2) 2.19.1. This Windows port builds against its
+  headers and import library and ships its libblosc2.dll in third_party/blosc2/ - third_party/blosc2/LICENSE.txt
+
+The deb and rpm packages (cmake/packaging.cmake) also carry, each with its license text: the SYCL runtime of
+intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.cpp's gguf-py (MIT, Copyright (c)
+2023-2026 The ggml authors), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes.
+The engine in the contrib-llvm packages is compiled with NVIDIA's CUDA Toolkit, and its code for NVIDIA GPUs can contain
+parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVIDIA CUDA Toolkit End User License
+Agreement.
+
+The models are not part of this repository; each model's own license applies to its files.
+Neither are the vendors' libraries the contrib-llvm and contrib-icpx modes link (Intel oneMKL and the runtime libraries of
+Intel's oneAPI compilers, NVIDIA cuBLAS and the CUDA runtime and driver); each one's own license applies to it.
+
+
+Strata (MIT License)
+--------------------
+
+Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+ggml / llama.cpp (MIT License)
+------------------------------
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

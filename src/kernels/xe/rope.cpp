@@ -1,0 +1,269 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2023-2026 The ggml authors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/kernels/xe/rope.cpp - the Xe ports of Strata's src/kernels/cuda/rope.cu (NEOX partial RoPE over a host-built table)
+// and Strata's src/kernels/cuda/native_rope.cu (the pinned ggml text IMRoPE), with the M-RoPE table they share.
+//
+// native_rope follows ggml/src/ggml-cuda/rope.cu (rope_multi/rope_yarn) at llama.cpp 3cf03257; MIT License,
+// Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE.  CUDA compiled it with --use_fast_math;
+// here pow, cos and sin are the precise SYCL functions.
+#include "strata/kernels/rope.hpp"
+#include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/mrope.hpp"
+#include "strata/core/on_device.hpp"
+#include "strata/core/runtime.hpp"
+#define STRATA_DEVICE_ARCH_TAG_TU xe_rope
+#include "strata/kernels/device_arch_tag.hpp"
+
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+
+namespace strata::kernels {
+namespace {
+
+sycl::queue& queue_for(void* stream) {
+    auto& queue = core::Runtime::get().stream(stream);
+    return queue;
+}
+
+// The tables of each engine device, as the CUDA build's per-device array: a layer split's stages each read their own
+// GPU's (one pointer for all made the B70 read the RTX 4070's image positions and hang at the first rotary layer)
+constexpr int kMaxDevices = 16;
+std::array<std::atomic<const int32_t*>, kMaxDevices> mrope_tab{};
+int device_slot() {
+    const int d = core::current_device();
+    if (d < 0 || d >= kMaxDevices) throw std::runtime_error("rope tables: engine device " + std::to_string(d));
+    return d;
+}
+std::atomic<bool> native_enabled{false};
+
+bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
+    auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+    return x <= y ? y - x < an : x - y < bn;
+}
+
+}  // namespace
+
+namespace {
+RopeScaling g_rope_scaling;   // one writer at startup, before any table or graph (rope_scaling.hpp)
+}  // namespace
+void rope_scaling_set(const RopeScaling& scaling) { g_rope_scaling = scaling; }
+const RopeScaling& rope_scaling() { return g_rope_scaling; }
+
+namespace {
+std::array<RopeTab, kMaxDevices> g_rope_tab;   // per engine device (set at startup, before any graph)
+std::array<RopeScaling, kMaxDevices> g_rope_tab_scaling;
+bool same_scaling(const RopeScaling& a, const RopeScaling& b) {
+    return a.type == b.type && a.freq_base == b.freq_base && a.factor == b.factor && a.freq_scale_in == b.freq_scale_in &&
+           a.orig_ctx == b.orig_ctx && a.ext_factor == b.ext_factor && a.attn_factor == b.attn_factor &&
+           a.beta_fast == b.beta_fast && a.beta_slow == b.beta_slow;
+}
+}  // namespace
+void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling) {
+    const int d = device_slot();
+    g_rope_tab[(size_t) d] = RopeTab{cos_tab, sin_tab, max_pos};
+    g_rope_tab_scaling[(size_t) d] = scaling;
+}
+void rope_table_release(const float* cos_tab) {
+    for (RopeTab& t : g_rope_tab)
+        if (t.cos == cos_tab) t = RopeTab{};
+}
+RopeTab rope_table_for(const RopeScaling& scaling) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ROPE_TABLE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!on) return RopeTab{};
+    const int d = device_slot();
+    return same_scaling(scaling, g_rope_tab_scaling[(size_t) d]) ? g_rope_tab[(size_t) d] : RopeTab{};
+}
+
+void mrope_table_set(const int32_t* device_table) {
+    mrope_tab[(size_t) device_slot()].store(device_table, std::memory_order_relaxed);
+}
+const int32_t* mrope_table() { return mrope_tab[(size_t) device_slot()].load(std::memory_order_relaxed); }
+
+void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
+    const int half = n_rot / 2;
+    for (int p = 0; p < max_pos; ++p) {
+        for (int i = 0; i < half; ++i) {
+            // float64 throughout, in the reference's order: inv, then ang, then cos/sin
+            const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
+            const double ang = (double) p * inv;
+            cos_tab[(size_t) p * half + i] = (float) std::cos(ang);
+            sin_tab[(size_t) p * half + i] = (float) std::sin(ang);
+        }
+    }
+}
+
+void build_rope_table(int n_rot, const RopeScaling& sc, int max_pos, float* cos_tab, float* sin_tab) {
+    if (sc.type == RopeScalingType::None) {
+        build_rope_table(n_rot, sc.freq_base, max_pos, cos_tab, sin_tab);   // the original loop, as it is
+        return;
+    }
+    const int half = n_rot / 2;
+    const double fs = sc.freq_scale();
+    const double ms = sc.mscale();
+    double cd[2];
+    sc.corr_dims(n_rot, cd);
+    const bool correct = sc.ext_factor != 0;   // ggml: the correction rides on ext_factor, not the type
+    for (int p = 0; p < max_pos; ++p) {
+        for (int i = 0; i < half; ++i) {
+            const double inv = std::pow(sc.freq_base, -2.0 * (double) i / (double) n_rot);
+            const double extrap = (double) p * inv;    // the trained angle, ggml's theta_extrap
+            const double interp = fs * extrap;         // ggml's theta_interp
+            double ang = interp;
+            if (correct) {
+                const double ramp = (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor;
+                ang = interp * (1.0 - ramp) + extrap * ramp;
+            }
+            cos_tab[(size_t) p * half + i] = (float) (std::cos(ang) * ms);
+            sin_tab[(size_t) p * half + i] = (float) (std::sin(ang) * ms);
+        }
+    }
+}
+
+// One work-item per row, as in the CUDA kernel: the tail copy and the rotation of a row never race.
+void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
+                     const float* sin_tab, const int* pos, void* stream) {
+    if (rows <= 0 || n_rot <= 0) return;
+    if (n_rot % 2 != 0 || n_rot > head_dim)
+        throw core::DeviceError("rope_neox_apply: n_rot " + std::to_string(n_rot) + " must be even and <= head_dim " +
+                                std::to_string(head_dim));
+    const int32_t* mtab = mrope_table();
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) rows), [=](sycl::id<1> id) {
+        const int64_t r = (int64_t) id[0];
+        const int half = n_rot / 2;
+        const float* xr = x + r * head_dim;
+        float* orow = out + r * head_dim;
+        for (int d = n_rot; d < head_dim; ++d) orow[d] = xr[d];      // the PARTIAL rotation's untouched tail
+        for (int i = 0; i < half; ++i) {
+            const size_t toff = (size_t) mrope_pos(mtab, pos[r], i) * half;   // the image path's per-pair position
+            rope_neox_pair(xr[i], xr[half + i], cos_tab[toff + i], sin_tab[toff + i], orow[i], orow[half + i]);
+        }
+    });
+    if (!stream) core::Runtime::get().wait(e, "rope_neox_apply");
+}
+
+void native_rope_set_enabled(bool value) { native_enabled.store(value, std::memory_order_relaxed); }
+bool native_rope_enabled() { return native_enabled.load(std::memory_order_relaxed); }
+
+void native_rope_apply(const float* x, float* out, int rows, int head_dim,
+                       int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
+    if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
+        (head_dim != 128 && head_dim != 256) || (n_rot != 64 && n_rot != head_dim) ||
+        rope_scaling_invalid(scaling) != nullptr ||
+        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4 ||
+        reinterpret_cast<uintptr_t>(positions) % 4) {
+        throw std::invalid_argument("native RoPE requires aligned F32 rows, width 128/256, rotation 64 or the width, valid base and explicit stream");
+    }
+    const size_t bytes = size_t(rows) * head_dim * sizeof(float);
+    if ((x != out && overlaps(x, bytes, out, bytes)) ||
+        overlaps(positions, size_t(rows) * sizeof(int), out, bytes) ||
+        overlaps(positions, size_t(rows) * sizeof(int), x, bytes)) {
+        throw std::invalid_argument("native RoPE buffers partially overlap");
+    }
+    auto& q = queue_for(stream);
+    // Match pinned host-side float powf before device powf/trigonometry.
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    // the IMRoPE sections and the float64 angle table are Qwen3.8's 64-wide rotary slice (32 pairs): a rotation over
+    // the whole head (llm-jp-4.1) computes its angles
+    const int32_t* mtab = n_rot == 64 ? mrope_table() : nullptr;
+    const int width = head_dim;
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(n_rot);
+    const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
+    q.parallel_for(sycl::range<2>((size_t) rows, (size_t) width / 2), [=](sycl::id<2> id) {
+        const int row = (int) id[0], pair = (int) id[1];
+        const size_t start = size_t(row) * width;
+        if (pair >= n_rot / 2) {
+            if (x != out) {
+                out[start + 2 * pair] = x[start + 2 * pair];
+                out[start + 2 * pair + 1] = x[start + 2 * pair + 1];
+            }
+            return;
+        }
+        const int p = mrope_pos(mtab, positions[row], pair);
+        float c, s;
+        if (!rope_tab_cs(tab, p, pair, c, s))
+            rope_cos_sin((float) p * sycl::pow(theta_scale, float(pair)), scaled, ka, pair, c, s);
+        const float a = x[start + pair], b = x[start + pair + n_rot / 2];
+        out[start + pair] = a * c - b * s;
+        out[start + pair + n_rot / 2] = a * s + b * c;
+    });
+}
+
+bool native_norm_rope_usable(int head_dim, int n_rot) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NO_NORM_ROPE");
+        return v == nullptr || std::strtol(v, nullptr, 10) == 0;
+    }();
+    return on && (head_dim == 128 || head_dim == 256) && (n_rot == 64 || n_rot == head_dim);
+}
+
+// upstream 088e8a82 (#783 PR-f): native_qsa_rms_norm_weighted (its 256-item form: the same partial sums, sub-group
+// sums and order) and native_rope_apply in one launch, so the result is the pair's bit for bit (rope_parity).  Every
+// item reads its values before the barrier, so out may be x (in_stride == head_dim).
+void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out, int rows, int head_dim,
+                              int n_rot, float epsilon, const RopeScaling& scaling, const int* positions, void* stream) {
+    if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
+        (head_dim != 128 && head_dim != 256) || in_stride < head_dim || (n_rot != 64 && n_rot != head_dim) ||
+        !std::isfinite(epsilon) ||
+        epsilon < 0.0f || rope_scaling_invalid(scaling) != nullptr || (x == out && in_stride != head_dim) ||
+        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(gamma) % 4 ||
+        reinterpret_cast<uintptr_t>(out) % 4 || reinterpret_cast<uintptr_t>(positions) % 4)
+        throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
+    constexpr int BlockSize = 256;
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    const int32_t* mtab = n_rot == 64 ? mrope_table() : nullptr;   // as native_rope_apply
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(n_rot);
+    const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
+    const int n_cols = head_dim;
+    queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) rows * BlockSize, BlockSize),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int tid = (int) it.get_local_id(0);
+            const size_t row = it.get_group(0);
+            const float* in = x + row * (size_t) in_stride;
+            float* o = out + row * (size_t) n_cols;
+            float partial = 0.0f;
+            for (size_t col = tid; col < size_t(n_cols); col += BlockSize) {
+                const float v = in[col];
+                partial += v * v;
+            }
+            const int half = n_rot / 2;
+            const float x_tid = tid < n_cols ? in[tid] : 0.0f;
+            const float x_hi = tid < half ? in[tid + half] : 0.0f;
+            for (int offset = 16; offset; offset >>= 1) partial += sycl::permute_group_by_xor(sg, partial, offset);
+            const int lane = tid % 32;
+            if (lane == 0) sums[tid / 32] = partial;
+            sycl::group_barrier(it.get_group());
+            partial = lane < BlockSize / 32 ? sums[lane] : 0.0f;
+            for (int offset = 16; offset; offset >>= 1) partial += sycl::permute_group_by_xor(sg, partial, offset);
+            const float mean = partial / (float) n_cols;
+            const float scale = sycl::rsqrt(mean + epsilon);
+            if (tid >= n_rot && tid < n_cols) {
+                o[tid] = scale * x_tid * gamma[tid];
+            } else if (tid < half) {
+                const float a = scale * x_tid * gamma[tid], b = scale * x_hi * gamma[tid + half];
+                const int p = mrope_pos(mtab, positions[row], tid);
+                float c, s;
+                if (!rope_tab_cs(tab, p, tid, c, s))
+                    rope_cos_sin((float) p * sycl::pow(theta_scale, float(tid)), scaled, ka, tid, c, s);
+                o[tid] = a * c - b * s;
+                o[tid + half] = a * s + b * c;
+            }
+        });
+    });
+}
+
+}  // namespace strata::kernels
