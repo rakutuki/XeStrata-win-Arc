@@ -16,6 +16,22 @@ cd /d "%~dp0"
 set XE=%~dp0
 set PYVENV=%~dp0.venv
 
+rem SETUP gate: on a fresh machine there is no serve config yet (SETUP.bat writes it as its last
+rem step), so SETUP has not been run. Run SETUP.bat right here, then continue with the normal
+rem startup below. The XE_SETUP_FROM_STARTHERE marker tells SETUP it was called from here: it then
+rem just returns instead of chaining back into START-HERE (which would loop).
+if not exist "%XE%strata-xe-iq3_s.json" (
+    echo     no serve config yet - this tree has not been set up. Running SETUP.bat now...
+    echo.
+    set XE_SETUP_FROM_STARTHERE=1
+    call "%XE%SETUP.bat"
+    if errorlevel 1 ( echo     SETUP did not finish - not starting. Fix it and run START-HERE.bat again. & pause & exit /b 1 )
+    if not exist "%XE%strata-xe-iq3_s.json" ( echo     SETUP finished but the config is still missing - not starting. & pause & exit /b 1 )
+    echo.
+    echo     SETUP done - continuing with the normal startup.
+    echo.
+)
+
 echo [1/5] checking for another running Strata server (this build never kills another server)...
 rem A second launch must NOT kill the server that is already serving :8080 - that server could be
 rem this same tree, restarted by accident. So: detect any running server (any tree), wait for it

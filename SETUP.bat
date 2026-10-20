@@ -1,6 +1,7 @@
 @echo off
 rem XeStrata-win SETUP: check this PC, make .venv, build if needed, write the serve config.
-rem Run this once on a new machine (double-click), then START-HERE.bat to start the server.
+rem Run this once on a new machine (double-click); when it finishes it starts the server itself
+rem (it calls START-HERE.bat). START-HERE.bat also runs SETUP first if the tree is not set up yet.
 setlocal EnableDelayedExpansion
 title XeStrata-win SETUP
 cd /d "%~dp0"
@@ -56,9 +57,14 @@ if not exist "%DD%\packs" ( call :fetch_models "%DD%" || exit /b 1 )
 if errorlevel 1 ( pause & exit /b 1 )
 
 echo.
-echo SETUP done. Double-click START-HERE.bat to start the server on :8080.
-pause
-goto :eof
+if defined XE_SETUP_FROM_STARTHERE (
+    echo SETUP done - START-HERE.bat continues the startup from where it paused.
+    exit /b 0
+)
+echo SETUP done. Starting the server now, exactly as START-HERE.bat does...
+echo.
+call "%~dp0START-HERE.bat"
+exit /b 0
 
 rem ---- the data folder is empty: fetch the model files from Hugging Face (asks first; ~60-90 GB).
 :fetch_models
