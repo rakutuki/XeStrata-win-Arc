@@ -82,7 +82,7 @@ function showTab(name) {
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") { loadConfig(); }
+  if (tab === "about") { loadConfig(); loadUpdate(); }
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -471,6 +471,45 @@ document.addEventListener("click", (e) => {
   if (b) copyText(b.dataset.copy, b);
 });
 $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+
+// ------------------------------------------------------------------ a newer release (GET/POST /update)
+// The server asks GitHub (at most every six hours, or now from the button); this page never leaves this server.
+async function loadUpdate(force = false) {
+  let u;
+  try {
+    const r = await fetch("update", force ? {method: "POST", headers: headers(true), body: "{}"} : {headers: headers()});
+    if (!r.ok) return false;
+    u = await r.json();
+  } catch (e) { return false; /* an older server: no check */ }
+  renderUpdate(u);
+  if (u.newer && store.get("update-told", "") !== u.tag) {   // once for each release
+    store.set("update-told", u.tag);
+    toast("info", `XeStrata ${u.tag} is out`, "About > Updates says how to update.", 8000,
+          {label: "Show", run: () => showTab("about")});
+  }
+  return true;
+}
+function renderUpdate(u) {
+  const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : null;
+  facts($("facts-update"), [
+    ["This version", `xe${u.current}`],
+    ["Latest release", u.tag ? `${u.tag}${u.newer ? " (newer)" : " (up to date)"}` : null],
+    ["Checked", when ? `${when}${u.automatic ? "" : " (automatic checks off)"}` : (u.automatic ? "not yet" : "automatic checks off")],
+  ]);
+  $("update-dot").hidden = !u.newer;
+  $("update-how").hidden = !u.newer;
+  if (u.newer) {
+    $("update-how").innerHTML = `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">Release notes of ${esc(u.tag)}</a>. ` +
+                                `To update: ${esc(u.how)}.`;
+  }
+  $("update-msg").textContent = u.error || "";
+}
+$("update-check").onclick = async () => {
+  $("update-check").disabled = true;
+  $("update-msg").textContent = "Checking…";
+  if (!await loadUpdate(true)) $("update-msg").textContent = "The server did not answer.";
+  $("update-check").disabled = false;
+};
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
@@ -1151,7 +1190,7 @@ setBusy(false);
 renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadSwitcher).then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
 setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too

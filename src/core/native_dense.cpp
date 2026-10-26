@@ -5,6 +5,7 @@
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/platform/memory.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -12,11 +13,14 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <cmath>
 #include <memory>
 #include <set>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -37,6 +41,20 @@ bool hc_q8_requested() {
     }();
     return on;
 }
+// STRATA_HC_REQ8=1 (upstream 2f44bf51, win2 form): the GGUF/pack BF16 hc down/up rows are requantized to Q8_0
+// (int8 + fp16 scale per 32) at load and fed to the same ref->hc_q8 verify-window path STRATA_HC_Q8 uses.  The
+// model's GGUF carries them as BF16 (Strata type 30), so STRATA_HC_Q8's Q8_0 filter finds nothing here; this
+// switch supplies the Q8 rows from the BF16 ones.  The verify window then reads half the bytes for the four
+// hyper-connection projections a token; the prompt path keeps the arena's BF16 rows.  Output-changing (another
+// summation and requantization loss), so opt-in; it costs the Q8 copy on top of the BF16 arena rows.
+bool hc_req8_requested() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HC_REQ8");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
 bool hc_q8_name(const std::string& name) {
     if (name == "output_hc_down.weight" || name == "output_hc_up.weight") return true;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -139,6 +157,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0;
         std::vector<std::pair<WeightRef*, DevicePtr>> hc_q8;
+    std::vector<uint8_t> hc_stage;   // STRATA_HC_REQ8 host staging
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -248,7 +267,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 pending.push_back(Pending{&ref, type, bytes, std::move(data)});
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!hc_q8_requested() || tensor.type != 8 || !hc_q8_name(tensor.name) || !in_range(tensor.name))
+                const bool direct = hc_q8_requested() && tensor.type == 8;
+                const bool req8 = hc_req8_requested() && tensor.type == 30;   // BF16 rows to requantize
+                if ((!direct && !req8) || !hc_q8_name(tensor.name) || !in_range(tensor.name))
                     continue;
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) continue;
@@ -263,7 +284,33 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 bool status = strata::gpu::alloc_device(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status) status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
+                if (req8 && status) {
+                    // Q8_0: per 32 values an fp16 scale and round-to-nearest int8 codes, the llama.cpp layout
+                    const uint16_t* bf = reinterpret_cast<const uint16_t*>(gguf.tensor_data(tensor));
+                    if (hc_stage.size() < bytes) hc_stage.resize((size_t) bytes);
+                    uint8_t* q = hc_stage.data();
+                    const int nblk = (int) (ref.ne0 / 32);
+                    for (int64_t row = 0; row < ref.ne1; ++row)
+                        for (int b = 0; b < nblk; ++b) {
+                            const uint16_t* src16 = bf + row * ref.ne0 + (int64_t) b * 32;
+                            uint8_t* dst = q + (row * nblk + b) * 34;
+                            float v[32], amax = 0.0f;
+                            for (int j = 0; j < 32; ++j) {
+                                const uint32_t bits = ((uint32_t) src16[j]) << 16;   // bf16 -> f32
+                                std::memcpy(&v[j], &bits, 4);
+                                if (std::fabs(v[j]) > amax) amax = std::fabs(v[j]);
+                            }
+                            uint16_t sh = strata::kernels::f16_from_f32(amax / 127.0f);
+                            const float ds = strata::kernels::f32_from_f16(sh);
+                            dst[0] = (uint8_t) (sh & 0xff); dst[1] = (uint8_t) (sh >> 8);
+                            for (int j = 0; j < 32; ++j) {
+                                const float r = ds > 0.0f ? std::nearbyintf(v[j] / ds) : 0.0f;
+                                const int c = r < -127.0f ? -127 : (r > 127.0f ? 127 : (int) r);
+                                dst[2 + j] = (uint8_t) (int8_t) c;
+                            }
+                        }
+                    if (status) status = strata::gpu::copy(data.get(), hc_stage.data(), bytes);
+                } else if (status) status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
                 if (!status) {
                     err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
@@ -293,8 +340,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             hc_q8_.push_back(data.release());
         }
         bytes_ = total + hc_q8_bytes;
-        if (hc_q8_requested())
-            std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
+        if (hc_q8_requested() || hc_req8_requested())
+            std::fprintf(stderr, "strata: hc_q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
                          (double) hc_q8_bytes / 1073741824.0, hc_q8_.size());
         return true;
     } catch (const std::exception& error) {

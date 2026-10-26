@@ -159,13 +159,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   endif()
 endif()
 
-# Published builds: keep the builder's personal source paths out of the binary's __FILE__ strings (asserts and
-# logs print them). clang-cl ignores -fmacro-prefix-map; -Xclang passes it to the clang front end. The mapping
-# root is this tree, so it works on any machine and re-fetches (_deps under the tree) are covered too.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM" AND WIN32)
-  add_compile_options("-Xclang" "-fmacro-prefix-map=${CMAKE_HOME_DIRECTORY}=C:/xestrata-build")
-endif()
-
 option(STRATA_ENABLE_XE "Build the Intel Xe runtime and migrated kernels" ON)
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
 set(_strata_tests_default OFF)
@@ -174,8 +167,6 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
-# The deb and rpm packages (cmake/packaging.cmake; tools/package/build.sh builds them in a clean container)
-option(STRATA_PACKAGE "install rules and CPack for the deb and rpm packages" OFF)
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
 # globally they would also hit FetchContent'd Catch2, whose warnings are not this project's to fix.
@@ -1025,8 +1016,4 @@ if(STRATA_BUILD_TESTS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
     add_subdirectory(tests)
   endif()
-endif()
-
-if(STRATA_PACKAGE)
-  include(cmake/packaging.cmake)
 endif()

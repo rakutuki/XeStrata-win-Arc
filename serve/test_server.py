@@ -1671,6 +1671,144 @@ class RecordingPrompt(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class IncrementalPrompts(unittest.TestCase):
+    """The prompt encoder: every request's ids are those of a full encode, and a turn reuses the previous one's."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingPrompt(tok, "Thinking.\n</think>\n\nThe answer.", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    post = ClientShapes.post
+
+    def test_turns(self):
+        self.assertIsNotNone(self.svc.prompts)
+        full = Service(self.engine, self.svc.tok, self.svc.template)
+        full.prompts = None                                  # the reference: the same prompt, encoded in full
+        msgs = [{"role": "system", "content": "Be brief."}]
+        for turn in range(6):
+            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
+            status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
+            self.assertEqual(status, 200, b)
+            prompt = self.svc.template.render(msgs)
+            self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))
+            if turn:
+                self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
+            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
+
+    def conversation(self, n):
+        """Messages of the n-th conversation: distinct from every other one from the number on."""
+        return [{"role": "user", "content": f"conversation {n} says: " + f"topic {n} sentence {n} " * 20}]
+
+    def service(self, **info):
+        engine = RecordingPrompt(self.svc.tok, "The answer.", max_context=CTX)
+        engine.info = info
+        return Service(engine, self.svc.tok, self.svc.template)
+
+    def test_the_kept_prompts_follow_the_engines_conversation_slots(self):
+        svc = self.service(conversation_cache_slots=8)
+        texts = []
+        for n in range(8):
+            msgs = self.conversation(n)
+            svc.encode_prompt(msgs, None, {})
+            texts.append(svc.render_prompt(msgs, None, {}))
+        self.assertEqual(len(svc.prompts.entries), 8)
+        self.assertEqual(sorted(e[0] for e in svc.prompts.entries), sorted(texts))
+        msgs = self.conversation(8)
+        svc.encode_prompt(msgs, None, {})
+        kept = sorted(e[0] for e in svc.prompts.entries)
+        self.assertEqual(len(kept), 8)
+        self.assertEqual(kept, sorted(texts[1:] + [svc.render_prompt(msgs, None, {})]))
+
+    def lazy_service(self, args, **info):
+        """A Service over the real StrataEngine class started lazily: no process yet, so no INFO line either."""
+        engine = StrataEngine("strata", args, lazy=True)
+        engine.info.update(info)
+        return Service(engine, self.svc.tok, self.svc.template)
+
+    def test_a_lazy_engine_keeps_the_prompts_its_arguments_ask_for(self):
+        svc = self.lazy_service(["--conversation-cache-slots", "8"])
+        for n in range(10):
+            svc.encode_prompt(self.conversation(n), None, {})
+        self.assertEqual(len(svc.prompts.entries), 8)
+
+    def test_the_slot_argument_wins_over_the_info_line_and_a_bad_one_falls_back(self):
+        self.assertEqual(self.lazy_service(["--conversation-cache-slots", "6"], conversation_cache_slots=3)
+                         .prompts.keep, 6)
+        self.assertEqual(self.lazy_service(["--conversation-cache-slots", "x"], conversation_cache_slots=3)
+                         .prompts.keep, 3)
+        self.assertEqual(self.lazy_service(["--conversation-cache-slots"]).prompts.keep, 4)
+        self.assertEqual(self.lazy_service([]).prompts.keep, 4)
+
+    def test_without_a_slot_setting_four_prompts_are_kept(self):
+        svc = self.service()
+        for n in range(6):
+            svc.encode_prompt(self.conversation(n), None, {})
+        self.assertEqual(len(svc.prompts.entries), 4)
+
+    def test_counting_tokens_leaves_the_kept_prompts_alone(self):
+        svc = self.service(conversation_cache_slots=2)
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        main = self.conversation(0)
+        status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 8, "messages": main})
+        self.assertEqual(status, 200, b)
+        before = list(svc.prompts.entries)
+        full = self.service()
+        full.prompts = None
+        for n in range(1, 6):
+            other = self.conversation(n)
+            status, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": other})
+            self.assertEqual(status, 200, b)
+            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {})))
+        self.assertTrue(svc.prompts.entries == before, "the count wrote into the kept prompts")
+        main.append({"role": "assistant", "content": "ok"})
+        main.append({"role": "user", "content": "and then?"})
+        svc.encode_prompt(main, None, {})
+        self.assertGreater(svc.prompts.last_reused, len(svc.render_prompt(main, None, {})) // 2)
+
+    def test_same_ids_as_a_full_encode_on_varied_conversations(self):
+        import random
+        sys.path.insert(0, str(ROOT / "tools"))
+        from test_strata_tokenizer import conversation_prompts, load_tokenizer
+        toks = [("byte", ByteTokenizer())]
+        qwen = load_tokenizer()
+        if qwen is not None:
+            toks.append(("qwen35", qwen))
+        for name, tok in toks:
+            svc = Service(self.engine, tok, self.svc.template)
+            for seed in range(3):
+                for what, prompt in conversation_prompts(self.svc.template, random.Random(seed)):
+                    with self.subTest(tokenizer=name, seed=seed, what=what):
+                        self.assertEqual(svc.prompts.encode(prompt), tok.encode(prompt, parse_special=True))
+
+    def test_a_tokenizer_without_resume_points_encodes_in_full(self):
+        class Plain:
+            """ByteTokenizer without the resume points."""
+            def __init__(self):
+                self.base = ByteTokenizer()
+
+            def __getattr__(self, name):
+                if name in ("encode_marked", "max_special_len"):
+                    raise AttributeError(name)
+                return getattr(self.base, name)
+        svc = Service(self.engine, Plain(), self.svc.template)
+        self.assertIsNone(svc.prompts)
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertEqual(svc.encode_prompt(msgs, None, {}),
+                         ByteTokenizer().encode(svc.render_prompt(msgs, None, {}), parse_special=True))
+
+
 class DyingEngine(MockEngine):
     """Issue #27: an engine that dies after a few tokens of its first answer, and comes back when restarted."""
 
@@ -2594,6 +2732,46 @@ class ConfigReasoningEffort(unittest.TestCase):
         cfg = {"args": ["--ctx", "4096"]}
         lift_reasoning_effort_arg(cfg)
         self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
+
+
+class JoinedEngineArgs(unittest.TestCase):
+    """#2267: "--ple-io mmap" written as one element of the config's args reached the engine as one argument."""
+
+    def split(self, args):
+        from serve.server import split_joined_args
+        cfg = {"args": list(args)}
+        with mock.patch("builtins.print") as pr:
+            split_joined_args(cfg)
+        return cfg["args"], pr.called
+
+    def test_one_element_becomes_flag_and_value(self):
+        self.assertEqual(self.split(["--spec", "4", "--ple-io mmap"]), (["--spec", "4", "--ple-io", "mmap"], True))
+        self.assertEqual(self.split(["--ple-io=mmap", "--kv int8"]), (["--ple-io", "mmap", "--kv", "int8"], True))
+
+    def test_proper_args_are_untouched(self):
+        args = ["--ple-io", "mmap", "--native", "/data/My Models/a b.gguf", "--max-context", "131072", "--vision"]
+        self.assertEqual(self.split(args), (args, False))
+        # a value in a flag's value place stays whole, whatever it looks like
+        args = ["--system-prompt", "--be brief please"]
+        self.assertEqual(self.split(args), (args, False))
+
+    def test_no_args(self):
+        from serve.server import split_joined_args
+        cfg = {}
+        split_joined_args(cfg)
+        self.assertEqual(cfg, {})
+
+    def test_bad_json_names_the_place(self):
+        import tempfile
+        from serve.server import read_config
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.json"
+            p.write_text('{"args": ["--ple-io" "mmap"]}', encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                read_config(p)
+            self.assertIn("line 1", str(cm.exception))
+            p.write_text('﻿{"args": ["--ple-io", "mmap"]}', encoding="utf-8")
+            self.assertEqual(read_config(p), {"args": ["--ple-io", "mmap"]})
 
 
 class SharedSettings(unittest.TestCase):

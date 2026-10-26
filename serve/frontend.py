@@ -1073,12 +1073,27 @@ class OutputParser:
         return out
 
     def _reset_scan(self):
+        self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+
+    def _wrapped_call_end(self) -> int:
+        # Without a closing tag the structural walk cannot finish. Search only
+        # newly appended text plus enough overlap for a tag split across feeds.
+        # A literal closing tag inside a value needs structural disambiguation:
+        # once any candidate appears, keep the original full walk for this call.
+        # Recovery can rewrite the buffer, so it always uses the full walk.
+        if not self.recover and self._call_end_checked >= 0:
+            start = max(0, self._call_end_checked - len(CALL_END) + 1)
+            if self.buf.find(CALL_END, start) < 0:
+                self._call_end_checked = len(self.buf)
+                return -1
+            self._call_end_checked = -1
+        return call_end(self.buf)
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -1186,10 +1201,19 @@ class OutputParser:
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
         best = 0
+        size = len(text)
         for tag in tags:
-            for n in range(1, len(tag)):
-                if text.endswith(tag[:n]):
-                    best = max(best, n)
+            if len(tag) <= 1:
+                continue
+            # Only a suffix beginning with the tag's first character can match.
+            # Ordinary token deltas contain no '<': one C-level search replaces
+            # checking every possible prefix. Earliest candidate is the longest.
+            start = text.find(tag[0], max(0, size - len(tag) + 1))
+            while start >= 0 and size - start > best:
+                if tag.startswith(text[start:]):
+                    best = size - start
+                    break
+                start = text.find(tag[0], start + 1)
         return best
 
     def feed(self, delta: str) -> list[Event]:
@@ -1385,7 +1409,7 @@ class OutputParser:
                         elif after and not CALL_END.startswith(after):
                             drop = 0
                 else:
-                    i = call_end(self.buf)
+                    i = self._wrapped_call_end()
                     if i >= 0:
                         drop = len(CALL_END)
                     if self.recover:                # a batch in one wrapper: the next call follows this one's

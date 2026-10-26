@@ -348,6 +348,29 @@ struct Writer {
             if (ok) chunk(src, len, typesize);
         }
     }
+    // a part streamed from a live source (device or pinned pool): one 16 MiB block at a time, so the host
+    // never holds more than the block.  The bytes are identical to part()'s for a captured buffer.
+    void part_source(const SessionKvSource& s, size_t part, int typesize = 0) {
+        const size_t n = s.sizes[part];
+        value((uint64_t) n);
+        if (!compressing(n, typesize)) {
+            value(kCodecNone);
+            for (size_t at = 0; at < n && ok; at += kChunk) {
+                const size_t len = std::min(kChunk, n - at);
+                stage.resize(len);
+                ok = s.read && s.read(part, at, stage.data(), len);
+                if (ok) write(stage.data(), len);
+            }
+            return;
+        }
+        value(kCodecBlosc2);
+        for (size_t at = 0; at < n && ok; at += kChunk) {
+            const size_t len = std::min(kChunk, n - at);
+            stage.resize(len);
+            ok = s.read && s.read(part, at, stage.data(), len);
+            if (ok) chunk(stage.data(), len, typesize);
+        }
+    }
     void chunk(const uint8_t* src, size_t len, int typesize) {
 #ifdef STRATA_HAVE_BLOSC2
         Blosc2Context& c = cctx[typesize];
@@ -827,7 +850,11 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         w.part(kv.k, kv_type); w.part(kv.v, kv_type); w.part(kv.k_scale); w.part(kv.v_scale);
         w.part(kv.pooled, sizeof(float));
     }
-    const long end = std::ftell(f);   // the file's length: the body ends it
+#ifdef _WIN32
+    const long long end = _ftelli64(f);   // long is 32-bit on Windows: ftell returns -1 past 2 GiB, and a
+#else
+    const long end = std::ftell(f);       // 130k+ token conversation's file is past that. 64-bit both ways.
+#endif
     bool ok = w.ok && end > 0;
     if (ok) {
         h.body_hash = w.hash.digest();
@@ -877,4 +904,175 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     return true;
 }
 
+
+// R1: the same file save() writes, but the K/V layers are streamed from live sources (device or pinned host)
+// in 16 MiB blocks instead of captured to a host snapshot first: the host peak is the running state plus one
+// block.  Used when the RAM cache or the physical-RAM gate refused the snapshot, so a refused park becomes a
+// disk park the next request restores in seconds instead of re-reading the whole prompt.
+bool ConversationDisk::save_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                                     size_t& written, std::string& error) {
+    written = 0;
+    if (!enabled_) return true;
+    const auto kept = kept_checkpoints(meta.checkpoints, options_.checkpoints);
+    Header h;
+    h.fingerprint = options_.fingerprint;
+    h.cvec = meta.cvec;
+    h.geometry = meta.geometry;
+    h.ids = meta.live.ids;
+    h.imgs = meta.live.imgs;
+    size_t payload = 0, body = 0;
+    auto count_one = [&](const ConversationCheckpoint& c) {
+        for (const auto* p : state_parts(c))
+            if (!add(payload, p->size()) || !add(body, kPartHeader)) return false;
+        return true;
+    };
+    auto count_state = [&](const ConversationCheckpoint& c) {
+        if (c.stage_parts.size() != options_.stage_parts) return false;
+        bool good = count_one(c);
+        for (const auto& part : c.stage_parts) good = good && count_one(part);
+        return good;
+    };
+    if (meta.live.stage_parts.size() != options_.stage_parts) {
+        error = "the conversation's layer-split parts differ from the folder's";
+        return false;
+    }
+    bool sized = count_state(meta.live) && add(body, sizeof(uint64_t));
+    for (size_t i : kept) {
+        const auto& c = meta.checkpoints[i];
+        if (c.ids.empty() || c.ids.size() > h.ids.size() || !std::equal(c.ids.begin(), c.ids.end(), h.ids.begin())) {
+            error = "a checkpoint is not a prefix of the conversation";
+            return false;
+        }
+        size_t images = 0;
+        while (images < h.imgs.size() && (uint64_t) h.imgs[images].start < c.ids.size()) ++images;
+        h.checkpoints.push_back({c.ids.size(), images, c.used});
+        sized = sized && count_state(c);
+    }
+    for (const auto& s : kv) {
+        for (size_t part = 0; part < 5; ++part)
+            sized = sized && add(payload, s.sizes[part]) && add(body, kPartHeader);
+        sized = sized && add(body, kLayerHeader);
+    }
+    sized = sized && add(body, payload);
+    h.payload = payload;
+    std::vector<uint8_t> header = encode(h);
+    size_t total = 4 + 4 + 8 + header.size() + 8;
+    if (!sized || !add(total, body)) {
+        error = "conversation size overflow";
+        return false;
+    }
+    if (total > options_.budget) {
+        error = "the conversation (" + std::to_string(total >> 20) + " MiB) exceeds the folder's budget";
+        return false;
+    }
+    Hash name;
+    name.update(options_.fingerprint.data(), options_.fingerprint.size());
+    name.update(h.ids.data(), h.ids.size() * sizeof(int32_t));
+    for (const auto& k : h.imgs) { name.update(&k.start, 8); name.update(&k.hash, 8); }
+    const uint8_t cvec = h.cvec;
+    name.update(&cvec, 1);
+    const fs::path path = options_.dir / (hex(name.digest()) + kExtension);
+    const fs::path tmp = path.string() + ".tmp";
+#ifdef _WIN32
+    const int fd = _wopen(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    std::FILE* f = fd < 0 ? nullptr : _fdopen(fd, "wb");
+    if (f == nullptr) {
+        if (fd >= 0) _close(fd);
+#else
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
+    if (f == nullptr) {
+        if (fd >= 0) ::close(fd);
+#endif
+        error = "cannot create " + tmp.string();
+        return false;
+    }
+    const uint64_t length = header.size();
+    auto prefix = [&]() {
+        Hash hh;
+        hh.update(header.data(), header.size());
+        const uint64_t header_hash = hh.digest();
+        return std::fwrite(kMagic, 1, 4, f) == 4 && std::fwrite(&kVersion, 4, 1, f) == 1 &&
+               std::fwrite(&length, 8, 1, f) == 1 && std::fwrite(header.data(), 1, header.size(), f) == header.size() &&
+               std::fwrite(&header_hash, 8, 1, f) == 1;
+    };
+#ifdef STRATA_HAVE_BLOSC2
+    std::optional<WideAffinity> wide;
+    if (options_.compress) wide.emplace();
+#endif
+    Writer w;
+    w.f = f;
+    w.compress = options_.compress;
+    w.ok = prefix();
+    auto write_one = [&](const ConversationCheckpoint& c) {
+        w.part(c.gdn.data(), c.gdn.size(), sizeof(float));
+        for (const auto* p : state_parts(c))
+            if (p != &c.gdn) w.part(p->data(), p->size());
+    };
+    auto write_state = [&](const ConversationCheckpoint& c) {
+        write_one(c);
+        for (const auto& part : c.stage_parts) write_one(part);
+    };
+    write_state(meta.live);
+    for (size_t i : kept) write_state(meta.checkpoints[i]);
+    w.value((uint64_t) kv.size());
+    for (const auto& s : kv) {
+        w.value(s.format); w.value(s.cells); w.value(s.heads); w.value(s.head_dim);
+        w.value(s.page_size); w.value(s.pooled_rows); w.value(s.idx_dim);
+        const int kv_type = (s.format & 15) == strata::kernels::kKvF16 ? 2 : 0;
+        w.part_source(s, 0, kv_type); w.part_source(s, 1, kv_type);
+        w.part_source(s, 2); w.part_source(s, 3);
+        w.part_source(s, 4, sizeof(float));
+    }
+#ifdef _WIN32
+    const long long end = _ftelli64(f);   // same 2 GiB ftell trap as save()'s
+#else
+    const long end = std::ftell(f);
+#endif
+    bool ok = w.ok && end > 0;
+    if (ok) {
+        h.body_hash = w.hash.digest();
+        header = encode(h);
+        ok = header.size() == length && std::fseek(f, 0, SEEK_SET) == 0 && prefix();
+    }
+    ok = std::fflush(f) == 0 && ok;
+#ifdef _WIN32
+    ok = _commit(_fileno(f)) == 0 && ok;
+#else
+    ok = ::fsync(::fileno(f)) == 0 && ok;
+#endif
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) fs::rename(tmp, path, ec);
+    if (!ok || ec) {
+        fs::remove(tmp, ec);
+        error = "cannot write " + path.string();
+        return false;
+    }
+    written = (size_t) end;
+    for (size_t i = 0; i < entries_.size();) {
+        const Entry& e = entries_[i];
+        const ConversationCheckpoint* deepest = nullptr;
+        for (const auto& c : e.checkpoints)
+            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if (e.path != path && e.cvec == h.cvec && deepest &&
+            conversation_chain_holds(*deepest, h.ids, h.imgs, meta.checkpoints)) {
+            remove_file(e.path);
+            continue;
+        }
+        ++i;
+    }
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.path == path; }),
+                   entries_.end());
+    Entry e;
+    e.path = path;
+    e.live.ids = h.ids;
+    e.live.imgs = h.imgs;
+    for (const auto& c : h.checkpoints) e.checkpoints.push_back(prefix_of(h, c));
+    e.cvec = h.cvec;
+    e.payload = payload;
+    entries_.push_back(std::move(e));
+    expire();
+    return true;
+}
 } // namespace strata::core

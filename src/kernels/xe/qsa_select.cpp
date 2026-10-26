@@ -245,6 +245,80 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         throw core::DeviceError("qsa_block_scores: unsupported indexer geometry");
     // a block past a query's n_bid returns at once: the launch need only reach the batch's largest n_bid
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+    // QSAROWS (upstream 5b6c9398, docs/QSAROWS.md; STRATA_QSA_ROWS=1 exactly, opt-in): the verify window's
+    // <= 4 queries scored in ONE launch with each query's slices (4 heads x 4 floats a lane) in registers for the
+    // whole kernel and the four heads' lane products reduce-scattered with warp_sum's pairing (xor 16, 8 leave one
+    // head per lane, then 4, 2, 1: six shuffles for the four heads) and gathered to lane 0 in head order (three
+    // more).  win2 has no multi kernel, so this also reads each block's keys once for all the window's rows.
+    // Every addition adds the same two operands of the same warp_sum level as the kernel below (float add
+    // commutes), the dot is the same expression, the relus sum in head order: the same score bits.  Upstream
+    // 2080 Ti/3060 micro-bench: 101 -> 55 us a call at T=4, decode +3.2% at 131k; the per-row win grows with
+    // the window, which is exactly win2's 87-190K agent context.
+    static const bool rows_on = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    if (rows_on && nq <= 4 && active_blocks <= 0) {
+        const size_t rgx = size_t((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS);
+        const auto er = queue_for(stream).parallel_for(
+            sycl::nd_range<1>(rgx * SCORE_WARPS * WARP, SCORE_WARPS * WARP),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int lane = int(sg.get_local_linear_id());
+                float qv[4][IDX_HEADS][4];
+                for (int qi = 0; qi < 4; ++qi)
+                    for (int h = 0; h < IDX_HEADS; ++h) {
+                        const float* q4 = q_idx + (qi < nq ? qi : 0) * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4;
+                        qv[qi][h][0] = qi < nq ? q4[0] : 0.0f;
+                        qv[qi][h][1] = qi < nq ? q4[1] : 0.0f;
+                        qv[qi][h][2] = qi < nq ? q4[2] : 0.0f;
+                        qv[qi][h][3] = qi < nq ? q4[3] : 0.0f;
+                    }
+                float dk[4];
+                for (int j = 0; j < 4; ++j) dk[j] = dead[lane * 4 + j];
+                const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
+                int64_t top = 0;
+                for (int q = 0; q < nq; ++q) { const int64_t nb = steps[q * kStepCount + kStepNBid]; top = nb > top ? nb : top; }
+                const int64_t wstride = int64_t(it.get_group_range(0)) * SCORE_WARPS;
+                for (int64_t b = int64_t(it.get_group(0)) * SCORE_WARPS + int64_t(sg.get_group_linear_id());
+                     b <= top && b < max_blocks; b += wstride) {
+                    const float* kp = pooled + b * IDX_DIM + lane * 4;
+                    float kk[4];
+                    for (int j = 0; j < 4; ++j) kk[j] = kp[j];
+                    for (int qi = 0; qi < nq; ++qi) {
+                        const int64_t n_bid = steps[qi * kStepCount + kStepNBid];
+                        if (b > n_bid) continue;
+                        const bool tail = b == n_bid;
+                        float d[IDX_HEADS];
+                        for (int h = 0; h < IDX_HEADS; ++h) {
+                            const float* k4 = tail ? dk : kk;
+                            d[h] = k4[0] * qv[qi][h][0] + k4[1] * qv[qi][h][1] + k4[2] * qv[qi][h][2] + k4[3] * qv[qi][h][3];
+                        }
+                        // reduce-scatter: after xor 16 the lane keeps heads {0,1} (bit 4 clear) or {2,3}; after xor 8 one head
+                        float r2[2];
+                        for (int i = 0; i < 2; ++i)
+                            r2[i] = (hi16 ? d[i + 2] : d[i]) + sycl::permute_group_by_xor(sg, hi16 ? d[i] : d[i + 2], 16);
+                        float r = (hi8 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi8 ? r2[0] : r2[1], 8);
+                        r += sycl::permute_group_by_xor(sg, r, 4);
+                        r += sycl::permute_group_by_xor(sg, r, 2);
+                        r += sycl::permute_group_by_xor(sg, r, 1);
+                        // lane 8h holds head h's full sum: gather to lane 0 and add the relus in head order, as the warp kernel
+                        const float s1 = sycl::select_from_group(sg, r, 8u);
+                        const float s2 = sycl::select_from_group(sg, r, 16u);
+                        const float s3 = sycl::select_from_group(sg, r, 24u);
+                        if (lane == 0) {
+                            float score = 0.0f;
+                            score += r > 0.0f ? r : 0.0f;
+                            score += s1 > 0.0f ? s1 : 0.0f;
+                            score += s2 > 0.0f ? s2 : 0.0f;
+                            score += s3 > 0.0f ? s3 : 0.0f;
+                            if (tail && steps[qi * kStepCount + kStepNKv] % R != 0) score += 1e9f;
+                            scores[qi * max_blocks + b] = score;
+                        }
+                    }
+                }
+            });
+        finish(stream, er, "qsa_block_scores (rows)");
+        return;
+    }
+
     const size_t gx = size_t((reach + SCORE_WARPS - 1) / SCORE_WARPS);
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<2>({size_t(nq), gx * SCORE_WARPS * WARP}, {1, SCORE_WARPS * WARP}),

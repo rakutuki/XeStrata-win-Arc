@@ -14,7 +14,7 @@
     "--prefill",
     "auto",
     "--spec",
-    "4",
+    "5",
     "--mtp",
     "%DATA%\\mtp\\rt",
     "--max-context",
@@ -26,7 +26,7 @@
     "--conversation-cache-mib",
     "3072",
     "--conversation-cache-min-free-mib",
-    "512",
+    "256",
     "--prompt-cache-tail"
   ],
   "cwd": "%TREE%",

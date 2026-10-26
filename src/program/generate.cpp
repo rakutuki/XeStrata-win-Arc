@@ -514,6 +514,11 @@ struct Options {
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
+    /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
+    /// A conversation that moved a few hundred tokens writes a full snapshot again, and the turn after that drops it
+    /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
+    /// whole-snapshot copy for nothing.  0 = park every turn, as before.
+    int64_t conversation_cache_park_gain = 0;
     /// --serve: write parked conversations to this folder (when the RAM cache pushes one out, and at QUIT) and
     /// read them back after a restart; empty = off.  Checkpoints per conversation (the deepest, the chain's root,
     /// then the most recently used), the folder's budget, and the age after its last use at which a file goes.
@@ -531,6 +536,7 @@ struct Options {
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
+    bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -668,6 +674,9 @@ void usage() {
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
+                 "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
+                 "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
+                 "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-save DIR  --serve: also keep parked conversations in DIR across restarts (default off;\n"
                  "                       needs --conversation-cache-mib)\n"
@@ -680,6 +689,9 @@ void usage() {
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
+                 "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
+                 "                       near it, thinner further back) instead of the most recently used: a client that\n"
+                 "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
@@ -2267,7 +2279,7 @@ int main(int argc, char** argv) {
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
+                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" || a == "--conversation-cache-park-gain" ||
                  a == "--conversation-save-checkpoints" ||
                  a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib" ||
                  a == "--memory-limit-mib") {
@@ -2275,7 +2287,7 @@ int main(int argc, char** argv) {
             int64_t parsed = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
             const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints" ||
-                                          a == "--conversation-cache-min-tokens"
+                                          a == "--conversation-cache-min-tokens" || a == "--conversation-cache-park-gain"
                                       ? INT32_MAX
                                   : a == "--conversation-save-hours" ? INT64_MAX / 3600
                                                                      : INT64_MAX / (int64_t{1024} * 1024);
@@ -2286,6 +2298,7 @@ int main(int argc, char** argv) {
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = parsed;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = parsed;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = parsed;
+            else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = parsed;
             else if (a == "--conversation-save-checkpoints") o.conversation_save_checkpoints = (int) parsed;
             else if (a == "--conversation-save-mib") o.conversation_save_mib = parsed;
             else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
@@ -2296,6 +2309,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
         else if (a == "--conversation-save-compress") o.conversation_save_compress = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+        else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
@@ -2633,10 +2647,13 @@ int main(int argc, char** argv) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
-    // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K
+    // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
+    // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
+    // from mtp_max_t left K=1 and K=2 with a window identical to not passing the flag at all.
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
-        o.spec = std::max(o.spec, std::min(o.mtp_max_t + o.lookup_chain, 8));   // kVerifyMaxT
+        const int chain_base = o.spec;
+        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));  // kVerifyMaxT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -6736,9 +6753,42 @@ int main(int argc, char** argv) {
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             const bool room = conversations.make_room(estimate, held, disk.enabled() ? &evicted : nullptr);
             save_evicted();   // before the capture allocates: the pushed-out images are freed once written
+            // R1: a RAM-gated park does not have to lose the conversation.  Stream it straight to the disk
+            // folder from the live state: the K/V never sits in a host buffer (16 MiB blocks), only the
+            // running state is captured (a fraction of the full snapshot).  The next request finds it through
+            // the disk layer's prefix match and restores it in seconds instead of re-reading the whole
+            // prompt (measured: 98-220 s for a 130k-token conversation).
+            auto stream_park = [&]() -> bool {
+                if (!disk.enabled()) return false;
+                strata::core::SavedConversation meta;
+                std::vector<strata::core::SessionKvSource> sources;
+                std::string serr;
+                try {
+                    if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                                                                     serr)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: streamed park skipped (%s)\n",
+                                     serr.c_str());
+                        return false;
+                    }
+                    size_t written = 0;
+                    if (!disk.save_streamed(meta, sources, written, serr)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: streamed park failed (%s)\n",
+                                     serr.c_str());
+                        return false;
+                    }
+                    std::fprintf(stderr, "strata serve: conversation cache: streamed park to disk: %zu tokens, "
+                                         "%zu MiB written (the RAM gate refused the snapshot)\n",
+                                 view.ids.size(), written >> 20);
+                    return true;
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: conversation cache: streamed park ran out of RAM\n");
+                    return false;
+                }
+            };
             if (!room) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available "
                                      "budget)\n", estimate >> 20);
+                stream_park();   // R1: the cache budget cannot hold it, stream it to disk
                 return true;
             }
             const auto t0 = Clock::now();
@@ -6771,6 +6821,7 @@ int main(int argc, char** argv) {
                                          "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  freed, conversations.size());
+                    stream_park();   // R1: refuse the RAM park, park on disk instead
                     return true;
                 }
                 if (freed)
@@ -6878,8 +6929,13 @@ int main(int argc, char** argv) {
                         for (size_t i = 0; i < n; ++i) pin_flags[i] = checks[i].pinned;
                         break;
                     }
-                const size_t victim = strata::program::conv_cache::eviction_victim(
-                    stamps.data(), n, o.prompt_cache, tail_flags.get(), pin_flags.get());
+                std::vector<int64_t> lens;
+                for (const ConvCheckpoint& k : checks) lens.push_back((int64_t) k.ids.size());
+                const size_t victim = o.prompt_cache_spread
+                    ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), stamps.size(),
+                                                                 o.prompt_cache, tail_flags.get(), pin_flags.get())
+                    : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
+                                                                   tail_flags.get(), pin_flags.get());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
         };
@@ -9033,7 +9089,17 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy
+            // this conversation wrote last), so a conversation that advanced fewer than N tokens since then keeps it:
+            // it still holds this conversation's prefix, and re-parking writes the whole snapshot only for the next
+            // turn to drop it again.  0 (the default) parks every turn, as before.
+            const size_t park_held = o.conversation_cache_park_gain > 0
+                                         ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
+                                         : 0;
+            const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
+                                    (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+                !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }

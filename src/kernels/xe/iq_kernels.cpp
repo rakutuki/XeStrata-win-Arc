@@ -736,12 +736,74 @@ inline void row_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
     for (int c = 0; c < NC; ++c) out[c] = warp_sum(sg, s[c]);
 }
 
-template<int TY, int NC>
-sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
-                          int n_out) {
+// ---------------------------------------------------------------- Tier3 T3-1 (upstream sycl/ 9de548d1 + db0b4d31)
+// STRATA_IQ3S_WIDE=1: the dense IQ3_S matrices (attn_q, attn_gate, ssm_out, attn_k, the shared experts' gate/up)
+// read with a fixed sub-vector per lane and whole blocks strided across the sub-group, four blocks in flight.
+// The fork's row_dot_multi already covers four blocks per iteration, but its lane-strided (kbx, iqs) order is what
+// keeps every column's sum bit-identical to one column alone; this kernel reorders the sub-block sums on purpose,
+// so its output differs from the default in the last bits (upstream's B70 unitrace: attn_k 77 -> 123 GB/s, attn_q
+// 114 -> 307, 1.36 -> 0.60 ms of kernel time per token). Unset or 0: the default kernels, exactly as before.
+// STRATA_MMVQ_LARGE_GRF=1: launch the multi-column kernels with a 256-register GRF (upstream db0b4d31: the A770
+// spills at 128 at 2-8 columns, Q6_K 4 columns 70-80 -> 150-237 GB/s). Only the launch property changes, the
+// output is bit-identical. Default off: upstream measured it on Alchemist only and this card is Xe2 - the bench
+// decides whether the B70 wants it.
+inline bool iq3s_wide_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_IQ3S_WIDE"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+inline bool mmvq_large_grf() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_MMVQ_LARGE_GRF"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+
+template<int NC>
+sycl::event launch_iq3s_wide_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y,
+                               int n_in, int n_out) {
+    using F = Fmt<21>;
     const size_t groups = (size_t) ((n_out + 3) / 4);
     return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, 4 * kWarp),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int row = (int) it.get_group(0) * 4 + (int) sg.get_group_linear_id();
+        if (row >= n_out) return;
+        const int lane = (int) sg.get_local_linear_id();
+        const int g = lane % F::ipb, sub = lane / F::ipb;   // one sub-vector per lane, blocks strided per sub-group
+        const int nb = n_in / F::qk;
+        const int iqs = F::step * g;
+        const uint8_t* rowp = w + (size_t) row * row_bytes;
+        float s[NC];
+        for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+        for (int kbx = sub; kbx < nb; kbx += kWarp / F::ipb) {
+            const auto wd = F::S::load(block_at<F>(rowp, kbx), 0, iqs);
+            const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+            for (int c = 0; c < NC; ++c) s[c] += F::S::apply(wd, x + (size_t) c * (size_t) (n_in / 32) + xo, iqs);
+        }
+        for (int c = 0; c < NC; ++c) s[c] = warp_sum(sg, s[c]);
+        if (lane == 0)
+            for (int c = 0; c < NC; ++c) y[(size_t) c * n_out + row] = s[c];
+    });
+}
+
+sycl::event launch_iq3s_wide(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y,
+                             int n_in, int n_out, int ncols) {
+    switch (ncols) {
+        case 1: return launch_iq3s_wide_n<1>(q, w, row_bytes, x, y, n_in, n_out);
+        case 2: return launch_iq3s_wide_n<2>(q, w, row_bytes, x, y, n_in, n_out);
+        case 3: return launch_iq3s_wide_n<3>(q, w, row_bytes, x, y, n_in, n_out);
+        case 4: return launch_iq3s_wide_n<4>(q, w, row_bytes, x, y, n_in, n_out);
+        case 5: return launch_iq3s_wide_n<5>(q, w, row_bytes, x, y, n_in, n_out);
+        case 6: return launch_iq3s_wide_n<6>(q, w, row_bytes, x, y, n_in, n_out);
+        case 7: return launch_iq3s_wide_n<7>(q, w, row_bytes, x, y, n_in, n_out);
+        default: return launch_iq3s_wide_n<8>(q, w, row_bytes, x, y, n_in, n_out);
+    }
+}
+// The multi-column launch needs two kernel names: the compiler refuses one kernel id for both the plain
+// and the grf_size<256> specialization (same-mangled-name error), so the GRF256 flag is part of the
+// functor's type and the body exists once.
+template <int TY, int NC, bool GRF256>
+struct MmvqNKernel {
+    const uint8_t* w; size_t row_bytes; const block_q8_1* x; float* y; int n_in; int n_out;
+    void operator()(sycl::nd_item<1> it) const {
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0) * 4 + (int) sg.get_group_linear_id();
         if (row >= n_out) return;
@@ -751,7 +813,27 @@ sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, co
         row_dot_multi<TY, NC>(sg, w + (size_t) row * row_bytes, x, (size_t) (n_in / 32), nb, lane, s);
         if (lane == 0)
             for (int c = 0; c < NC; ++c) y[(size_t) c * n_out + row] = s[c];
-    });
+    }
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        if constexpr (GRF256)
+            return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                               sycl::ext::oneapi::experimental::sub_group_size<kWarp>};
+        else
+            return sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::sub_group_size<kWarp>};
+    }
+};
+
+template<int TY, int NC>
+sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
+                          int n_out) {
+    const size_t groups = (size_t) ((n_out + 3) / 4);
+    if constexpr (NC > 1) {
+        if (mmvq_large_grf())
+            return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, 4 * kWarp),
+                                  MmvqNKernel<TY, NC, true>{w, row_bytes, x, y, n_in, n_out});
+    }
+    return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, 4 * kWarp),
+                          MmvqNKernel<TY, NC, false>{w, row_bytes, x, y, n_in, n_out});
 }
 
 // up to 8 columns in one pass, the count exact (upstream 2715a752: 3, 5, 6 and 7 took two or three passes); 8 at a
@@ -1657,6 +1739,14 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
     sycl::event e;
+    // Tier3 T3-1: the wide IQ3_S read (opt-in); the exact-column-count launches mirror launch_mmvq's chunking.
+    if (t == 21 && iq3s_wide_on() && n_in % QK_K == 0) {
+        for (int c0 = 0; c0 < ncols;) {
+            const int take = ncols - c0 >= 8 ? 8 : ncols - c0;
+            e = launch_iq3s_wide(q, W, rb, X + (size_t) c0 * (n_in / 32), y + (size_t) c0 * n_out, n_in, n_out, take);
+            c0 += take;
+        }
+    } else
     switch (t) {
         case 16: e = launch_mmvq<16>(q, W, rb, X, y, n_in, n_out, ncols); break;
         case 17: e = launch_mmvq<17>(q, W, rb, X, y, n_in, n_out, ncols); break;

@@ -777,8 +777,12 @@ class _WinXeGpu:
                     counters.append((inst.rsplit("engtype_", 1)[-1], c))
             if not counters:
                 return
+            d = ctypes.c_void_p()   # the card these engine instances belong to, in bytes: the LUID witness
+            if pdh.PdhAddEnglishCounterW(h, "\\GPU Adapter Memory(%s)\\Dedicated Usage" % luid,
+                                         None, ctypes.byref(d)) != 0:
+                d = None
             self.counters = counters
-            self.pdh = (pdh, h, counters)
+            self.pdh = (pdh, h, counters, d)
         except (OSError, AttributeError):
             self.pdh = None
 
@@ -840,14 +844,61 @@ class _WinXeGpu:
         tx = (st.output - prev[1]) / dt / 2**20 if st.output >= prev[1] else None
         return rx, tx
 
+    def _reopen_pdh(self):
+        """(Re)open the card's counters.  The GPU Engine instances are per process and appear only once a process
+        touches the card, and the sampler starts before the engine does: the first enumeration sees the previous
+        run's instances (dead, they read 0), and the LUID match runs against a card whose VRAM is not yet
+        distinguishable from the other cards' (it can pick the wrong card, whose instances read 0 forever).
+        _util calls this when the readings stop making sense."""
+        if self.pdh is not None:
+            try:
+                self.pdh[0].PdhCloseQuery.argtypes = [ctypes.c_void_p]
+                self.pdh[0].PdhCloseQuery(self.pdh[1])
+            except OSError:
+                pass
+        self.pdh = None
+        self.counters = []
+        luid = self._engine_luid()
+        if luid:
+            self._open_pdh(luid)
+
+    def _pdh_retry(self):
+        """Re-enumerate at most every _pdh_backoff seconds: 30 s, doubling to 10 min while it keeps failing,
+        reset once the counters answer again (an idle card with the engine loaded must not re-run PowerShell
+        every half minute)."""
+        now = time.time()
+        if now - getattr(self, "_pdh_try", 0.0) >= getattr(self, "_pdh_backoff", 30.0):
+            self._pdh_try = now
+            self._pdh_backoff = min(600.0, getattr(self, "_pdh_backoff", 30.0) * 2)
+            self._reopen_pdh()
+
     def _util(self):
         """The card's load: the sum of its engines' utilization, per engine type, the busiest type's sum - the
-        engines of one type share the card's compute units, so their sums are the card's 0-100% scale."""
+        engines of one type share the card's compute units, so their sums are the card's 0-100% scale.  The
+        counters re-enumerate themselves while they are stale: the card's Dedicated Usage no longer matches the
+        VRAM sysman reads (the LUID was matched while the engine's VRAM was still indistinguishable, so the
+        counters belong to another card), or no engine instance answers at all (the engine's process died and a
+        new one's instances were never added)."""
+        if self.pdh is None:
+            self._pdh_retry()
         if self.pdh is None:
             return None
-        pdh, h, counters = self.pdh
+        pdh, h, counters, dedicated = self.pdh
         if pdh.PdhCollectQueryData(h) != 0:
             return None
+        if dedicated is not None:   # still the engine's card?
+            cv, cs = _PdhCounterValue(), ctypes.c_uint32()
+            used, _ = self._mem()
+            r = pdh.PdhGetFormattedCounterValue(dedicated, ctypes.c_uint32(0x200), ctypes.byref(cs),
+                                                ctypes.byref(cv))
+            if r != 0 or (used is not None and used > 4 * 2**30
+                          and abs(cv.u.Double - used) > 2.0 * 2**30):
+                self._pdh_retry()
+                if self.pdh is None:
+                    return None
+                pdh, h, counters, dedicated = self.pdh
+                if pdh.PdhCollectQueryData(h) != 0:
+                    return None
         by_type = {}
         for engtype, c in counters:
             cv = _PdhCounterValue()
@@ -855,8 +906,12 @@ class _WinXeGpu:
             if pdh.PdhGetFormattedCounterValue(c, ctypes.c_uint32(0x200), ctypes.byref(cs), ctypes.byref(cv)) == 0:
                 by_type[engtype] = by_type.get(engtype, 0.0) + cv.u.Double
         if not by_type:
+            self._pdh_retry()
             return None
-        return max(0.0, min(100.0, max(by_type.values())))
+        util = max(0.0, min(100.0, max(by_type.values())))
+        if util > 0.5:
+            self._pdh_backoff = 30.0   # the counters answer: a future staleness is retried soon again
+        return util
 
 
 def _gpu(pci=None):

@@ -16,6 +16,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_kernels
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <cfloat>
@@ -799,6 +800,107 @@ struct Gdn {
     };
     static_assert(HV % HK == 0 && VPK <= RG && GdnRecKh::GB <= GdnRecKh::NT, "the key-head form's layout");
 
+    // Variant 6, the Xe sub-group recurrence (upstream 65cf5435, sycl/include/strata/prefill/gdn_xe.hpp): the
+    // column kernel's four row groups and their S-long FMA chains in the same order, but a 16-lane sub-group holds
+    // four columns x four row groups (lane % 4 = column, lane / 4 = row group), so the two cross-row-group sums are
+    // sub-group shuffles instead of SLM round trips and a token needs one work-group barrier instead of five.
+    // Bit-identical to upstream's variant 0 on an A770; against win2's D-2 the only arithmetic difference is
+    // native::exp vs exp (last bits).  256 GRFs a thread: an offline DG2 compile spilled 4000 bytes a thread at the
+    // default 128; keeping the state in SLM removed the spill but ran ~4x slower on an A770, so it stays in registers.
+    struct GdnXeRec {
+        static constexpr int CB = 16, NCB = S / CB, NT = CB * 4;   // 64 work-items = four 16-lane sub-groups
+        float* state; const float* h; const float* gate; const float* beta; float* y; int64_t T;
+        sycl::local_accessor<float, 1> inputs;
+        void operator()(sycl::nd_item<1> it) const {
+            const auto sg = it.get_sub_group();
+            const unsigned lane = sg.get_local_linear_id();
+            const unsigned rg = lane / 4, c = lane % 4;
+            const unsigned tid = it.get_local_linear_id();
+            const unsigned head = it.get_group_linear_id() / NCB;
+            const unsigned cbk = it.get_group_linear_id() % NCB;
+            const unsigned col = cbk * CB + sg.get_group_linear_id() * 4 + c;
+            const unsigned qh = head % HK;
+            constexpr unsigned RPG = S / 4;
+            constexpr size_t rs = (size_t) HV * S;
+            float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+            float s[RPG];
+#pragma unroll
+            for (unsigned r = 0; r < RPG; ++r) s[r] = base[r * rs];
+            float nq[2], nk[2], nv = 0, ng = 0, nb = 0;
+            auto fetch = [&](int64_t t) {
+                const float* ht = h + t * C;
+#pragma unroll
+                for (unsigned u = 0; u < 2; ++u) {
+                    nq[u] = ht[qh * S + tid + u * NT];
+                    nk[u] = ht[HK * S + qh * S + tid + u * NT];
+                }
+                nv = ht[2 * HK * S + head * S + col];
+                ng = gate[t * HV + head];
+                nb = beta[t * HV + head];
+            };
+            if (T > 0) fetch(0);
+            for (int64_t t = 0; t < T; ++t) {
+                // Alternate q/k banks. The barrier at t-1 guarantees every read of bank t-2 has finished before we
+                // overwrite it at t. No end barrier.
+                const unsigned bank = (t & 1) * 2 * S;
+#pragma unroll
+                for (unsigned u = 0; u < 2; ++u) {
+                    inputs[bank + tid + u * NT] = nq[u];
+                    inputs[bank + S + tid + u * NT] = nk[u];
+                }
+                const float cv = nv, cg = ng, cbt = nb;
+                it.barrier(sycl::access::fence_space::local_space);
+                if (t + 1 < T) fetch(t + 1);
+                const float g = sycl::native::exp(cg);
+                float kv = 0.0f;
+#pragma unroll
+                for (unsigned r = 0; r < RPG; ++r)
+                    kv = sycl::fma(s[r], inputs[bank + S + rg * RPG + r], kv);
+                // Do not replace with reduce_over_group: keep ((p0+p1)+p2)+p3, exactly the old
+                // red[0][c]+red[1][c]+red[2][c]+red[3][c] expression.
+                auto sum4 = [&](float x) {
+                    const float p0 = sycl::select_from_group(sg, x, c);
+                    const float p1 = sycl::select_from_group(sg, x, c + 4);
+                    const float p2 = sycl::select_from_group(sg, x, c + 8);
+                    const float p3 = sycl::select_from_group(sg, x, c + 12);
+                    return p0 + p1 + p2 + p3;
+                };
+                const float kv_col = sum4(kv);
+                const float delta = (cv - g * kv_col) * cbt;
+                float o = 0.0f;
+#pragma unroll
+                for (unsigned r = 0; r < RPG; ++r) {
+                    s[r] = sycl::fma(g, s[r], inputs[bank + S + rg * RPG + r] * delta);
+                    o = sycl::fma(s[r], inputs[bank + rg * RPG + r], o);
+                }
+                const float oc = sum4(o) * sycl::rsqrt(float(S));
+                if (rg == 0) y[t * HV * S + (int64_t) head * S + col] = oc;
+            }
+#pragma unroll
+            for (unsigned r = 0; r < RPG; ++r) base[r * rs] = s[r];
+        }
+        auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+            return sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                                               sycl::ext::oneapi::experimental::sub_group_size<16>};
+        }
+    };
+    static_assert(GdnXeRec::NCB * GdnXeRec::CB == S, "the Xe form's layout");
+
+    // STRATA_GDN_XE=1: the variant-6 recurrence on any Intel GPU with 16-lane sub-groups.  Upstream defaults it on
+    // for Alchemist only; win2 has no intel_gpu_gen helper and its card is Xe2 (where GdnRecLane already runs), so
+    // the default here is OFF everywhere and the A/B bench decides.  =0 forces off even if a future default turns it on.
+    static bool gdn_xe_on(sycl::queue& q) {
+        static core::PerDevice<bool> per_device;
+        return per_device.get(q.get_device(), [&] {
+            const char* v = std::getenv("STRATA_GDN_XE");
+            if (v == nullptr || v[0] == '0') return false;
+            const sycl::device d = q.get_device();
+            if (!d.is_gpu() || d.get_info<sycl::info::device::vendor_id>() != 0x8086) return false;
+            const auto subgroups = d.get_info<sycl::info::device::sub_group_sizes>();
+            return std::find(subgroups.begin(), subgroups.end(), size_t(16)) != subgroups.end();
+        });
+    }
+
     // Whether GdnRecLane<16> runs on this device: a GRF holds 16 floats only where the EU is 16 wide (Xe2; the 8-wide
     // EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
     // STRATA_GDN_REC_LANE=0: the D-2 kernel (A/B).
@@ -952,7 +1054,13 @@ struct Gdn {
         // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
         // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
         static int pick = -1;   // 1: the key-head form
-        if (gdn_lane_ok(q))
+        if (T > 0 && gdn_xe_on(q)) {
+            q.submit([&](sycl::handler& hd) {
+                hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * GdnXeRec::NT, GdnXeRec::NT),
+                                GdnXeRec{state, h, gate, beta, y, T,
+                                        sycl::local_accessor<float, 1>(sycl::range<1>(4 * S), hd)});
+            });
+        } else if (gdn_lane_ok(q))
             q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
         else {
             if (pick < 0 && kh_on && T >= 64) {

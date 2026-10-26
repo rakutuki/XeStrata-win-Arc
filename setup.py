@@ -77,7 +77,7 @@ if (ROOT / "PACKAGED").is_file():
     PACKAGED = json.loads((ROOT / "PACKAGED").read_text(encoding="utf-8"))
 CONF = xdg_dir("XDG_CONFIG_HOME", ".config") if PACKAGED else ROOT        # the model configs, xestrata-<model>.json
 STATE = xdg_dir("XDG_STATE_HOME", ".local/state") if PACKAGED else ROOT   # the logs, and the engine's working folder
-SETUP_CMD = "xestrata" if PACKAGED else "./setup.sh"
+SETUP_CMD = "xestrata" if PACKAGED else "SETUP.bat"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
 # on any day.  A revision the repository no longer has falls back to its current files, with a message (download()).

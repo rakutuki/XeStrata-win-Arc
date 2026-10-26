@@ -7,6 +7,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_file.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -75,6 +76,14 @@ public:
     // oldest ones over the budget.  A conversation whose uncompressed size exceeds the budget is not written.
     // `written`: file bytes.
     bool save(const SavedConversation& image, size_t& written, std::string& error);
+
+    // R1: write a conversation that will not fit the RAM cache straight from the live state: `meta` holds
+    // everything but the K/V (its kv must be empty, like the session SAVE's), `kv` streams the layers from
+    // where they live (device or pinned host) in 16 MiB blocks, so the peak host cost is the running state
+    // plus one block, not the whole snapshot.  The file is the ordinary .xsc format: the next request's
+    // best() finds it and load() restores it like any other parked conversation.
+    bool save_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                       size_t& written, std::string& error);
     // Deletes files older than max_age, then the oldest while the folder is over its budget.  Returns how many.
     size_t expire();
 

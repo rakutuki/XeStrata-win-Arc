@@ -36,7 +36,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About<span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
@@ -163,6 +163,13 @@ SPDX-License-Identifier: LGPL-3.0-or-later
       <div class="st-card">
         <span class="card-title">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>
+      </div>
+      <div class="st-card">
+        <span class="card-title">Updates</span>
+        <dl class="facts" id="facts-update"></dl>
+        <p class="muted small" id="update-how" hidden></p>
+        <div class="cfg-actions"><button class="st-btn st-btn--secondary" id="update-check" type="button">Check now</button>
+          <span class="muted small" id="update-msg" role="status"></span></div>
       </div>
       <div class="st-card">
         <span class="card-title">This PC</span>
